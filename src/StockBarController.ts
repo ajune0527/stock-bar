@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import Configuration from './configuration';
 import { eastMoneyProvider, StockSearchResult } from './eastmoney_provider';
 import logger from './logger';
-import { render, stopAllRender } from './render';
+import { render, stopAllRender, initRenderCommands } from './render';
 import Stock from './stock';
 import { QuickPickView } from './view/quickpick_view';
 import { StockTreeDataProvider } from './view/stockTree';
@@ -192,6 +192,8 @@ export default class StockBarController {
 			treeDataProvider: this.treeDataProvider,
 			showCollapseAll: false,
 		});
+
+		initRenderCommands(context);
 
 		context.subscriptions.push(
 			treeView,
