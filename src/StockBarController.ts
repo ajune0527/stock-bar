@@ -1,177 +1,182 @@
 import * as vscode from 'vscode';
-import logger from './logger';
 import Configuration from './configuration';
-import { stockProvider, sinaStockProvider } from './provider';
-import { render, renderFutures, stopAllRender } from './render';
+import { eastMoneyProvider, StockSearchResult } from './eastmoney_provider';
+import logger from './logger';
+import { render, stopAllRender } from './render';
 import Stock from './stock';
-import FutureHandler from './futures';
-import { clearInterval } from 'timers';
-import { StockQuickPickItem } from './vscode/StockQuickPickItem';
+import { QuickPickView } from './view/quickpick_view';
+import { StockTreeDataProvider } from './view/stockTree';
+import { StockWebView } from './view/webview';
 
 export default class StockBarController {
-	private timer: NodeJS.Timer | null = null;
+	private timer: ReturnType<typeof setInterval> | null = null;
 	private stocks: Stock[] = [];
-	private futureHandler = new FutureHandler();
-	private quickPick = this.createQuickPick();
+	private quickPickView: QuickPickView;
+	private treeDataProvider: StockTreeDataProvider;
+	private webView: StockWebView;
 
 	constructor() {
 		this.stocks = this.loadChoiceStocks();
-	}
-
-	private createQuickPick(): vscode.QuickPick<StockQuickPickItem> {
-		const picker = vscode.window.createQuickPick<StockQuickPickItem>();
-		picker.canSelectMany = false;
-		picker.matchOnDescription = true;
-		picker.matchOnDetail = true;
-		picker.onDidAccept(() => {
-			const item = picker.selectedItems[0];
-			if (!picker.busy) {
-				item?.action();
-			}
-		});
-		return picker;
+		this.quickPickView = new QuickPickView();
+		this.treeDataProvider = new StockTreeDataProvider();
+		this.webView = new StockWebView();
+		this.quickPickView.onRefresh(() => this.restart());
+		this.webView.onRefresh(() => this.restart());
 	}
 
 	private loadChoiceStocks(): Stock[] {
 		return Configuration.getStocks().map((item) => {
-			if (typeof item === 'string') return new Stock(item);
-			if (typeof item === 'object')
-				return new Stock(
-					item.code,
-					item.alias,
-					item.hold_price,
-					item.hold_number,
-				);
-			throw new Error(
-				'配置格式错误, 查看 https://github.com/Chef5/stock-bar#配置',
-			);
+			return new Stock(item.code, item.market);
 		});
 	}
 
+	private isTradingTime(): boolean {
+		const now = new Date();
+		// 使用上海时区获取时间
+		const shanghaiTime = new Intl.DateTimeFormat('zh-CN', {
+			timeZone: 'Asia/Shanghai',
+			hour: 'numeric',
+			minute: 'numeric',
+			weekday: 'short',
+			hour12: false,
+		}).formatToParts(now);
+
+		const parts = Object.fromEntries(shanghaiTime.map(p => [p.type, p.value]));
+		const day = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'].indexOf(parts.weekday);
+		// 周末不交易
+		if (day === 0 || day === 6) {
+			return false;
+		}
+
+		const hour = parseInt(parts.hour, 10);
+		const minute = parseInt(parts.minute, 10);
+		const time = hour * 60 + minute;
+
+		// 上午 9:30 - 11:30
+		const morningStart = 9 * 60 + 30;
+		const morningEnd = 11 * 60 + 30;
+		// 下午 13:00 - 15:00
+		const afternoonStart = 13 * 60;
+		const afternoonEnd = 15 * 60;
+
+		return (time >= morningStart && time <= morningEnd) ||
+			   (time >= afternoonStart && time <= afternoonEnd);
+	}
+
 	private async ticker(): Promise<void> {
+		// 非交易时间不请求新数据
+		if (!this.isTradingTime()) {
+			logger.debug('非交易时间，跳过数据请求');
+			return;
+		}
+
 		try {
 			logger.debug('call fetchData');
-			const [stockData] = await Promise.all([
-				stockProvider.fetch(this.stocks.map((s) => s.code)),
-				this.futureHandler.updateData(),
-			]);
+			const secids = this.stocks.map((s) => s.getSecid());
+			const stockData = await eastMoneyProvider.fetch(secids);
 
 			stockData.forEach((data) => {
 				const stock = this.stocks.find(
-					(s) => s.code.toLowerCase() === data.code,
+					(s) => s.code.toLowerCase() === data.code?.toLowerCase(),
 				);
-				stock?.update(data);
+				if (stock && data) {
+					stock.update(data as Stock);
+				}
 			});
 
 			logger.debug('render');
 			render(this.stocks);
-			renderFutures(this.futureHandler.futures);
+
+			this.quickPickView.updateStocks(this.stocks);
+			this.treeDataProvider.updateStocks(this.stocks);
+			this.webView.updateStocks(this.stocks);
 		} catch (error) {
 			logger.error('%O', error);
 		}
 	}
 
-	private openQuickPick(items: StockQuickPickItem[], title = ''): void {
-		this.quickPick.busy = false;
-		this.quickPick.value = '';
-		this.quickPick.items = items;
-		this.quickPick.placeholder = title;
-		this.quickPick.show();
+	public openStockList(): void {
+		this.quickPickView.show();
 	}
 
-	private async searchStocks(query: string): Promise<void> {
-		const fixCode = (code: string) => {
-			if (code.startsWith('6')) {
-				return `sh${code}`;
-			}
-			if (code.startsWith('0') || code.startsWith('3')) {
-				return `sz${code}`;
-			}
-			return code;
-		};
-		const stockItems = await sinaStockProvider.fetch([fixCode(query)]);
-		const selectionItems: StockQuickPickItem[] = stockItems.map((stock) => ({
-			label: stock.name === '---' ? '无结果' : stock.name,
-			action: () => this.handleStockSelection(stock),
-		}));
-
-		selectionItems.push({
-			label: '返回',
-			action: () => this.openSearch(),
-		});
-
-		this.openQuickPick(selectionItems);
-	}
-
-	private async handleStockSelection(stock: Stock): Promise<void> {
-		if (stock.name === '---') {
-			vscode.window.showErrorMessage('股票代码不存在，请重新重新添加！');
-			return;
-		}
-
-		const code = stock.code.toLowerCase();
-		const currentStocks = Configuration.getStocks() || [];
-		const exists = currentStocks.some((item) =>
-			typeof item === 'string'
-				? item.toLowerCase() === code
-				: item.code.toLowerCase() === code,
-		);
-
-		if (!exists) {
-			currentStocks.push({
-				code,
-				alias: stock.name,
-				hold_price: 0,
-				hold_number: 0,
-			});
-			await Configuration.stockBarConfig().update(
-				'stocks',
-				currentStocks,
-				vscode.ConfigurationTarget.Global,
-			);
-			vscode.window.showInformationMessage(
-				`已成功添加：${stock.name} (${code})`,
-			);
-			this.quickPick.hide();
-			this.restart();
-		} else {
-			vscode.window.showInformationMessage(
-				`股票 ${stock.name} (${code}) 已存在！`,
-			);
-		}
-	}
-
-	private async openSearch(): Promise<void> {
+	public async openSearch(): Promise<void> {
 		const input = await vscode.window.showInputBox({
-			prompt: `sh：沪市，不加前缀的情况下，6 开头的代码默认加上 sh（上证指数：sh000001）
-				sz：深市，不加前缀的情况下，除 6 开头的代码外，默认加上 sz
-				hk：港股，如：阿里巴巴港股 hk09988
-				US_：美股，如：苹果股票 US_AAPL
-				hkHSC：工商指数（港股指数）
-				hkHSCEI：恒生中国企业指数（港股指数）
-				hkHSI：恒生指数（港股指数）
-				hkHSCCI：红筹指数（港股指数）
-				hkHSF：恒生金融分类（港股指数）
-				hkHSP：恒生地产分类（港股指数）
-				hkHSU：恒生公用事业分类（港股指数）
-				hkGEM：标普香港创业板指（港股指数）
-				US_DOWJONES：道琼斯指数（美股指数）
-				US_NASDAQ：纳斯达克（美股指数）
-				US_SP500：标普 500（美股指数）`,
-			placeHolder:
-				'请输入股票代码，支持沪深、港股、美股，具体格式参考占位文本说明',
+			prompt: '输入股票名称或代码搜索',
 		});
 
 		if (input?.trim()) {
-			await this.searchStocks(input.trim());
+			await this.searchAndAdd(input.trim());
 		}
+	}
+
+	private async searchAndAdd(query: string): Promise<void> {
+		try {
+			const searchResults = await eastMoneyProvider.search(query);
+
+			if (searchResults.length === 0) {
+				vscode.window.showWarningMessage('未找到相关股票');
+				return;
+			}
+
+			const items = searchResults.map((result) => ({
+				label: result.name,
+				description: result.code,
+				detail: '市场: ' + result.securityTypeName,
+				result,
+			}));
+
+			const selected = await vscode.window.showQuickPick(items, {
+				title: '选择要添加的股票',
+				placeHolder: '搜索结果',
+			});
+
+			if (selected) {
+				await this.addStock(selected.result);
+			}
+		} catch (error) {
+			logger.error('搜索失败: %O', error);
+			vscode.window.showErrorMessage('搜索失败，请重试');
+		}
+	}
+
+	private async addStock(result: StockSearchResult): Promise<void> {
+		const code = result.code;
+		const market = result.market;
+
+		const currentStocks = Configuration.getStocks() || [];
+		const exists = currentStocks.some(
+			(item) => item.code === code,
+		);
+
+		if (exists) {
+			vscode.window.showInformationMessage('股票 ' + result.name + ' (' + code + ') 已存在！');
+			return;
+		}
+
+		currentStocks.push({ code, market });
+
+		await Configuration.stockBarConfig().update(
+			'stocks',
+			currentStocks,
+			vscode.ConfigurationTarget.Global,
+		);
+
+		vscode.window.showInformationMessage('已添加：' + result.name + ' (' + code + ')');
+		this.restart();
+	}
+
+	private getMarketName(market: string): string {
+		const marketMap: Record<string, string> = {
+			'1': '沪市A股',
+			'0': '深市A股',
+		};
+		return marketMap[market] || market;
 	}
 
 	public restart(): void {
 		const interval = Configuration.getUpdateInterval();
 		if (this.timer) clearInterval(this.timer);
 		this.stocks = this.loadChoiceStocks();
-		this.futureHandler.updateConfig(Configuration.getFutures());
 		this.timer = setInterval(() => this.ticker(), interval);
 		this.ticker();
 	}
@@ -183,10 +188,53 @@ export default class StockBarController {
 	}
 
 	public registerCommands(context: vscode.ExtensionContext): void {
+		const treeView = vscode.window.createTreeView('stockBarList', {
+			treeDataProvider: this.treeDataProvider,
+			showCollapseAll: false,
+		});
+
 		context.subscriptions.push(
+			treeView,
 			vscode.commands.registerCommand('stockbar.start', () => this.restart()),
 			vscode.commands.registerCommand('stockbar.stop', () => this.stop()),
 			vscode.commands.registerCommand('stockbar.add', () => this.openSearch()),
+			vscode.commands.registerCommand('stockbar.list', () => this.openStockList()),
+			vscode.commands.registerCommand('stockbar.webview', () => this.webView.show()),
+			vscode.commands.registerCommand('stockbar.refresh', () => {
+				this.restart();
+				vscode.window.showInformationMessage('数据已刷新');
+			}),
+			vscode.commands.registerCommand('stockbar.treeItem.remove', (node) => {
+				if (node?.stock) {
+					this.removeStock(node.stock);
+				}
+			}),
+			vscode.commands.registerCommand('stockbar.treeItem.add', (node) => {
+				if (node?.searchResult) {
+					this.addStock(node.searchResult);
+				}
+			}),
+			// 排序命令
+			vscode.commands.registerCommand('stockbar.treeItem.moveUp', (node) => {
+				if (node?.stock) {
+					this.moveStock(node.stock, 'up');
+				}
+			}),
+			vscode.commands.registerCommand('stockbar.treeItem.moveDown', (node) => {
+				if (node?.stock) {
+					this.moveStock(node.stock, 'down');
+				}
+			}),
+			vscode.commands.registerCommand('stockbar.treeItem.moveTop', (node) => {
+				if (node?.stock) {
+					this.moveStock(node.stock, 'top');
+				}
+			}),
+			vscode.commands.registerCommand('stockbar.treeItem.moveBottom', (node) => {
+				if (node?.stock) {
+					this.moveStock(node.stock, 'bottom');
+				}
+			}),
 			vscode.workspace.onDidChangeConfiguration(() => {
 				if (this.timer) this.restart();
 			}),
@@ -195,8 +243,67 @@ export default class StockBarController {
 		this.restart();
 	}
 
+	private async removeStock(stock: Stock): Promise<void> {
+		const confirm = await vscode.window.showWarningMessage(
+			'确定要从自选中删除 ' + (stock.name || stock.code) + ' 吗？',
+			'确定',
+			'取消',
+		);
+
+		if (confirm !== '确定') return;
+
+		const currentStocks = Configuration.getStocks() || [];
+		const newStocks = currentStocks.filter(
+			(item) => item.code !== stock.code,
+		);
+
+		await Configuration.stockBarConfig().update(
+			'stocks',
+			newStocks,
+			vscode.ConfigurationTarget.Global,
+		);
+
+		vscode.window.showInformationMessage('已删除：' + (stock.name || stock.code));
+		this.restart();
+	}
+
+	private async moveStock(stock: Stock, direction: 'up' | 'down' | 'top' | 'bottom'): Promise<void> {
+		const currentStocks = Configuration.getStocks() || [];
+		const currentIndex = currentStocks.findIndex(item => item.code === stock.code);
+
+		if (currentIndex === -1) return;
+
+		const newStocks = [...currentStocks];
+		newStocks.splice(currentIndex, 1);
+
+		let newIndex: number;
+		switch (direction) {
+			case 'up':
+				newIndex = Math.max(0, currentIndex - 1);
+				break;
+			case 'down':
+				newIndex = Math.min(newStocks.length, currentIndex + 1);
+				break;
+			case 'top':
+				newIndex = 0;
+				break;
+			case 'bottom':
+				newIndex = newStocks.length;
+				break;
+		}
+
+		newStocks.splice(newIndex, 0, currentStocks[currentIndex]);
+
+		await Configuration.stockBarConfig().update(
+			'stocks',
+			newStocks,
+			vscode.ConfigurationTarget.Global,
+		);
+
+		this.restart();
+	}
+
 	public dispose(): void {
-		this.stop(); // 清理定时器
-		this.quickPick.dispose(); // 释放 QuickPick
+		this.stop();
 	}
 }

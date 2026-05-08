@@ -1,10 +1,7 @@
 export default class Stock {
 	code: string;
-	symbol: string;
+	market: string; // 1=沪市, 0=深市
 	name: string | null;
-	alias: string;
-	hold_price = 0;
-	hold_number = 0;
 	price = 0;
 	updown = 0;
 	percent = 0;
@@ -13,34 +10,27 @@ export default class Stock {
 	open = 0;
 	yestclose = 0;
 
-	constructor(
-		code: string,
-		alias?: string | undefined,
-		hold_price?: number | undefined,
-		hold_number?: number | undefined,
-	) {
-		this.setCode(code);
-		this.symbol = code;
-		this.name = null;
-		this.alias = alias ?? '';
-		this.hold_price = hold_price ?? 0;
-		this.hold_number = hold_number ?? 0;
-	}
-	update(origin: Stock) {
-		this.name = origin.name;
-		this.price = origin.price;
-		this.high = origin.high;
-		this.low = origin.low;
-		this.updown = origin.updown;
-		this.percent = origin.percent;
-		this.open = origin.open;
-		this.yestclose = origin.yestclose;
-	}
-	setCode(code: string) {
-		if (code.slice(0, 2) === 'US') {
-			this.code = code.toLowerCase().replace('us_', 'gb_');
-			return;
-		}
+	constructor(code: string, market: string) {
 		this.code = code;
+		this.market = market
+		this.name = null;
+	}
+
+	/**
+	 * 获取 secid 格式 (市场.代码)
+	 */
+	getSecid(): string {
+		return `${this.market}.${this.code}`;
+	}
+
+	update(origin: Partial<Stock>) {
+		this.name = origin.name || null;
+		this.price = origin.price || 0;
+		this.high = origin.high || 0;
+		this.low = origin.low || 0;
+		this.updown = origin.updown || 0;
+		this.percent = origin.percent || 0;
+		this.open = origin.open || 0;
+		this.yestclose = origin.yestclose || 0;
 	}
 }

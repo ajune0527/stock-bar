@@ -1,37 +1,24 @@
 import * as vscode from 'vscode';
-import { StockOptions, FutureOptions } from 'stock-bar';
+
+/**
+ * 股票配置项
+ */
+export interface StockConfig {
+	code: string;
+	market: string; // 1=沪市, 0=深市
+}
 
 export default class Configuration {
-	/**
-	 * @private
-	 */
 	static stockBarConfig() {
 		return vscode.workspace.getConfiguration('stock-bar');
 	}
 
-	/**
-	 * @deprecated
-	 */
-	static getShowTime() {
-		return Configuration.stockBarConfig().get('showTime');
-	}
-
-	static getStocks() {
+	static getStocks(): StockConfig[] {
 		const stocks = Configuration.stockBarConfig().get('stocks');
-		if (Object.prototype.toString.call(stocks) === '[object Object]') {
-			return this.updateStocks(stocks as Record<string, string>);
-		}
-		return stocks as StockOptions;
-	}
-
-	static getFutures() {
-		const futures = Configuration.stockBarConfig().get('futures');
-		if (!futures) {
+		if (!stocks || !Array.isArray(stocks)) {
 			return [];
 		}
-		const items = futures as FutureOptions;
-		items.forEach((item) => (item.code = item.code.toUpperCase()));
-		return items;
+		return stocks as StockConfig[];
 	}
 
 	static getUpdateInterval() {
@@ -45,32 +32,5 @@ export default class Configuration {
 
 	static getFallColor() {
 		return Configuration.stockBarConfig().get('fallColor');
-	}
-
-	static getShowAccountPnL() {
-		const showAccountPnL = Configuration.stockBarConfig().get('showAccountPnL');
-		return showAccountPnL !== false;
-	}
-
-	/**
-	 * 获取是否使用qos.hk接口获取港美股实时数据
-	 */
-	static getUseQosForHkUs() {
-		return Configuration.stockBarConfig().get('useQosForHkUs') === true;
-	}
-
-	/**
-	 * 获取qos.hk接口的token
-	 */
-	static getQosHkToken() {
-		return Configuration.stockBarConfig().get('qosHkToken') as string;
-	}
-
-	static updateStocks(stocks: Record<string, string>) {
-		const newStocks: StockOptions = Object.entries(stocks).map(
-			([code, alias]) => (alias ? { code, alias } : code),
-		);
-		Configuration.stockBarConfig().update('stocks', newStocks, 1);
-		return newStocks;
 	}
 }
