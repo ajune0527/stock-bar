@@ -15,6 +15,8 @@ import { getStockTrendHtml } from './stockTrendHtml';
 
 export class StockTrendViewProvider implements vscode.WebviewViewProvider {
 	private view: vscode.WebviewView | undefined;
+	private autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
+	private static readonly AUTO_REFRESH_INTERVAL_MS = 5000;
 	private readonly model = new TrendSelectionModel(
 		(secid) => {
 			const instrument = toAxDataInstrumentFromSecid(secid);
@@ -50,7 +52,27 @@ export class StockTrendViewProvider implements vscode.WebviewViewProvider {
 			if (this.view === webviewView) {
 				this.view = undefined;
 			}
+			this.stopAutoRefresh();
 		});
+		this.startAutoRefresh();
+	}
+
+	private startAutoRefresh(): void {
+		if (this.autoRefreshTimer !== null) {
+			return;
+		}
+		this.autoRefreshTimer = setInterval(() => {
+			if (this.view?.visible) {
+				this.model.autoRefresh();
+			}
+		}, StockTrendViewProvider.AUTO_REFRESH_INTERVAL_MS);
+	}
+
+	private stopAutoRefresh(): void {
+		if (this.autoRefreshTimer !== null) {
+			clearInterval(this.autoRefreshTimer);
+			this.autoRefreshTimer = null;
+		}
 	}
 
 	showStock(stock: Stock): void {

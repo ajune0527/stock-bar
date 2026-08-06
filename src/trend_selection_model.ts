@@ -75,6 +75,20 @@ export class TrendSelectionModel {
 		this.select(this.selected);
 	}
 
+	/**
+	 * 静默刷新：保持当前分时图不闪动，拉取最新数据后直接替换；
+	 * 失败时保留旧数据，不切换到错误态。
+	 */
+	autoRefresh(): void {
+		if (!this.selected) {
+			return;
+		}
+		const key = stockKey(this.selected);
+		this.generation += 1;
+		const generation = this.generation;
+		void this.load(key, this.selected, generation, { silent: true });
+	}
+
 	syncStocks(stocks: readonly TrendStockSnapshot[]): void {
 		if (!this.selected) {
 			return;
@@ -109,6 +123,7 @@ export class TrendSelectionModel {
 		key: string,
 		stock: TrendStockSnapshot,
 		generation: number,
+		options: { silent?: boolean } = {},
 	): Promise<void> {
 		try {
 			const trends = await this.fetchTrends(key);
@@ -130,6 +145,9 @@ export class TrendSelectionModel {
 				!this.selected ||
 				stockKey(this.selected) !== key
 			) {
+				return;
+			}
+			if (options.silent) {
 				return;
 			}
 			this.emit({

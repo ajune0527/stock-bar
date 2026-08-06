@@ -146,6 +146,57 @@ suite('Sidebar trend selection model', function () {
 		assert.equal(model.currentState().trends[0].price, 2);
 	});
 
+	test('autoRefresh silently replaces trends without a loading state', async function () {
+		const requests = [];
+		const states = [];
+		const model = new TrendSelectionModel(
+			() => {
+				const request = deferred();
+				requests.push(request);
+				return request.promise;
+			},
+			(state) => states.push(state),
+		);
+
+		model.select(stock('600000'));
+		requests[0].resolve([{ time: '09:30', price: 8.6, volume: 10, amount: 86 }]);
+		await flushPromises();
+		assert.equal(states.at(-1).status, 'ready');
+
+		model.autoRefresh();
+		assert.equal(states.at(-1).status, 'ready');
+		requests[1].resolve([{ time: '09:30', price: 8.7, volume: 20, amount: 174 }]);
+		await flushPromises();
+
+		assert.equal(states.at(-1).status, 'ready');
+		assert.equal(states.at(-1).trends[0].price, 8.7);
+		assert.equal(requests.length, 2);
+	});
+
+	test('autoRefresh keeps the old chart when the fetch fails', async function () {
+		const requests = [];
+		const states = [];
+		const model = new TrendSelectionModel(
+			() => {
+				const request = deferred();
+				requests.push(request);
+				return request.promise;
+			},
+			(state) => states.push(state),
+		);
+
+		model.select({ ...stock('600000'), price: 8.6 });
+		requests[0].resolve([{ time: '09:30', price: 8.6, volume: 100, amount: 86 }]);
+		await flushPromises();
+
+		model.autoRefresh();
+		requests[1].reject(new Error('network down'));
+		await flushPromises();
+
+		assert.equal(states.at(-1).status, 'ready');
+		assert.equal(states.at(-1).trends[0].price, 8.6);
+	});
+
 	test('a stale response cannot overwrite a newer selection', async function () {
 		const requests = [];
 		const model = new TrendSelectionModel(
