@@ -1,6 +1,26 @@
 import axios, { AxiosError, AxiosInstance } from 'axios';
 import Stock from './stock';
 
+function finiteNumber(value: string): number {
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function parseTrendRecord(record: string): TrendData | null {
+	const parts = record.split(',');
+	if (parts.length < 4) {
+		return null;
+	}
+	const averagePrice = finiteNumber(parts[3]);
+	return {
+		time: parts[0],
+		price: finiteNumber(parts[1]),
+		volume: finiteNumber(parts[2]),
+		amount: averagePrice,
+		averagePrice,
+	};
+}
+
 /**
  * 东方财富股票数据接口
  * 使用 push2.eastmoney.com 和 push2delay.eastmoney.com 接口
@@ -200,15 +220,10 @@ class EastMoneyProvider {
 			const trends: TrendData[] = [];
 
 			for (const item of rep.data.data.trends) {
-				// 格式: 时间,价格,成交量,成交额
-				const parts = item.split(',');
-				if (parts.length >= 4) {
-					trends.push({
-						time: parts[0],
-						price: Number(parts[1]) || 0,
-						volume: Number(parts[2]) || 0,
-						amount: Number(parts[3]) || 0,
-					});
+				// 格式: 时间,价格,成交量,当日累计均价
+				const trend = parseTrendRecord(item);
+				if (trend) {
+					trends.push(trend);
 				}
 			}
 
@@ -239,6 +254,7 @@ export interface TrendData {
 	price: number;
 	volume: number;
 	amount: number;
+	averagePrice: number;
 }
 
 // 导出单例

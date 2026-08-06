@@ -1,6 +1,8 @@
+import { getCategory, MarketCategory } from './market';
+
 export default class Stock {
 	code: string;
-	market: string; // 1=沪市, 0=深市
+	market: string; // 东方财富 secid 市场编码：1=沪市, 0=深市, 116=港股, 105=NASDAQ, 106=NYSE, 107=AMEX
 	name: string | null;
 	price = 0;
 	updown = 0;
@@ -12,7 +14,7 @@ export default class Stock {
 
 	constructor(code: string, market: string) {
 		this.code = code;
-		this.market = market
+		this.market = market;
 		this.name = null;
 	}
 
@@ -23,14 +25,21 @@ export default class Stock {
 		return `${this.market}.${this.code}`;
 	}
 
+	/**
+	 * 获取市场分类：A股 / 港股 / 美股
+	 */
+	getCategory(): MarketCategory {
+		return getCategory(this.market);
+	}
+
 	update(origin: Partial<Stock>) {
-		this.name = origin.name || null;
-		this.price = origin.price || 0;
-		this.high = origin.high || 0;
-		this.low = origin.low || 0;
-		this.updown = origin.updown || 0;
-		this.percent = origin.percent || 0;
-		this.open = origin.open || 0;
-		this.yestclose = origin.yestclose || 0;
+		if (origin.name !== undefined) this.name = origin.name;
+		if (origin.price !== undefined) this.price = origin.price;
+		if (origin.high !== undefined) this.high = origin.high;
+		if (origin.low !== undefined) this.low = origin.low;
+		if (origin.updown !== undefined) this.updown = origin.updown;
+		if (origin.percent !== undefined) this.percent = origin.percent;
+		if (origin.open !== undefined) this.open = origin.open;
+		if (origin.yestclose !== undefined) this.yestclose = origin.yestclose;
 	}
 }

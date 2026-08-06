@@ -61,7 +61,7 @@ export class StockWebView {
 	}
 
 	private async sendTrendsData(code: string): Promise<void> {
-		const stock = this.stocks.find(s => s.code === code);
+		const stock = this.stocks.find((s) => s.code === code);
 		if (!stock) {
 			return;
 		}
@@ -73,6 +73,7 @@ export class StockWebView {
 				command: 'trendsData',
 				code,
 				data: trends,
+				category: stock.getCategory(),
 				yestclose: stock.yestclose,
 			});
 		} catch (error) {
@@ -88,9 +89,7 @@ export class StockWebView {
 
 	private async deleteStock(code: string): Promise<void> {
 		const currentStocks = Configuration.getStocks() || [];
-		const newStocks = currentStocks.filter(
-			(item) => item.code !== code,
-		);
+		const newStocks = currentStocks.filter((item) => item.code !== code);
 
 		await Configuration.stockBarConfig().update(
 			'stocks',
@@ -107,10 +106,12 @@ export class StockWebView {
 			name: stock.name || stock.code,
 			code: stock.code,
 			secid: stock.getSecid(),
+			category: stock.getCategory(),
 			price: stock.price.toFixed(2),
-			percent: stock.percent >= 0
-				? '+' + (stock.percent * 100).toFixed(2) + '%'
-				: (stock.percent * 100).toFixed(2) + '%',
+			percent:
+				stock.percent >= 0
+					? '+' + (stock.percent * 100).toFixed(2) + '%'
+					: (stock.percent * 100).toFixed(2) + '%',
 			yestclose: stock.yestclose.toFixed(2),
 			isRise: stock.percent >= 0,
 		}));
@@ -195,17 +196,23 @@ export class StockWebView {
 							 </tr>
 						 </thead>
 						 <tbody>
-							 ${stockData.map((stock) => `
+							 ${stockData
+									.map(
+										(stock) => `
 								 <tr class="table-row border-t border-color">
 									 <td class="px-4 py-3">
 										 <div class="font-medium">${stock.name}</div>
 										 <div class="text-xs opacity-60">${stock.code}</div>
 									 </td>
-									 <td class="px-4 py-3 text-right font-mono ${stock.isRise ? 'text-rise' : 'text-fall'}">
+									 <td class="px-4 py-3 text-right font-mono ${
+											stock.isRise ? 'text-rise' : 'text-fall'
+										}">
 										 ${stock.price}
 										 <span class="ml-1">${stock.isRise ? '↑' : '↓'}</span>
 									 </td>
-									 <td class="px-4 py-3 text-right font-mono font-medium ${stock.isRise ? 'text-rise' : 'text-fall'}">
+									 <td class="px-4 py-3 text-right font-mono font-medium ${
+											stock.isRise ? 'text-rise' : 'text-fall'
+										}">
 										 ${stock.percent}
 									 </td>
 									 <td class="px-4 py-3 text-right font-mono opacity-70">${stock.yestclose}</td>
@@ -225,12 +232,22 @@ export class StockWebView {
 										 </button>
 									 </td>
 								 </tr>
-								 <tr id="trend-row-${stock.code}" class="trend-row border-t border-color hidden">
+								 <tr id="trend-row-${
+										stock.code
+									}" class="trend-row border-t border-color hidden">
 									 <td colspan="5" class="p-2">
-										 <canvas id="chart-${stock.code}" class="trend-canvas w-full" height="100" data-code="${stock.code}" data-yestclose="${stock.yestclose}"></canvas>
+										 <canvas id="chart-${
+												stock.code
+											}" class="trend-canvas w-full" height="100" data-code="${
+											stock.code
+										}" data-category="${stock.category}" data-yestclose="${
+											stock.yestclose
+										}"></canvas>
 									 </td>
 								 </tr>
-							 `).join('')}
+							 `,
+									)
+									.join('')}
 						 </tbody>
 					   </table>`
 			}
@@ -306,7 +323,40 @@ export class StockWebView {
 		}
 
 		// 绘制分时图
+		// 各市场交易时段配置（分钟，从午夜起算）
+		const AXIS_CONFIG = {
+			A:  { total: 240, sessions: [[570, 690], [780, 900]] }, // 09:30-11:30, 13:00-15:00
+			HK: { total: 330, sessions: [[570, 720], [780, 960]] }, // 09:30-12:00, 13:00-16:00
+			US: { total: 390, sessions: [[570, 960]] },             // 09:30-16:00
+		};
+
+		function parseMinutes(timeStr) {
+			const timePart = timeStr.includes(' ') ? timeStr.split(' ')[1] : timeStr;
+			const [h, m] = timePart.split(':').map(Number);
+			return h * 60 + m;
+		}
+
+		// 将时间字符串映射为 0..total 的连续交易分钟数
+		function timeToOffset(category, timeStr) {
+			const cfg = AXIS_CONFIG[category] || AXIS_CONFIG.A;
+			const mins = parseMinutes(timeStr);
+			let offset = 0;
+			for (const [s, e] of cfg.sessions) {
+				if (mins <= e) {
+					return Math.max(0, Math.min(cfg.total, offset + (mins - s)));
+				}
+				offset += e - s;
+			}
+			return cfg.total;
+		}
+
+		function pad2(n) { return String(n).padStart(2, '0'); }
+		function fmtTime(m) { return pad2(Math.floor(m / 60)) + ':' + pad2(m % 60); }
+
 		function drawTrendChart(canvas, trends, yestclose) {
+			const category = canvas.dataset.category || 'A';
+			const axisCfg = AXIS_CONFIG[category] || AXIS_CONFIG.A;
+			const totalMinutes = axisCfg.total;
 			const ctx = canvas.getContext('2d');
 			const dpr = window.devicePixelRatio || 1;
 			const rect = canvas.getBoundingClientRect();
@@ -321,6 +371,11 @@ export class StockWebView {
 			const chartWidth = width - padding.left - padding.right;
 			const chartHeight = height - padding.top - padding.bottom;
 
+			// 将交易分钟数转换为X坐标
+			function minutesToX(minutes) {
+				return padding.left + (minutes / totalMinutes) * chartWidth;
+			}
+
 			// 清空画布
 			ctx.clearRect(0, 0, width, height);
 
@@ -332,35 +387,6 @@ export class StockWebView {
 				return;
 			}
 
-			// 交易时间段: 09:30-11:30 (120分钟), 13:00-15:00 (120分钟)
-			// 总交易时间: 240分钟
-			const totalMinutes = 240;
-			const morningEnd = 120; // 上午结束位置
-			const afternoonStart = 120; // 下午开始位置
-
-			// 将时间字符串转换为交易分钟数
-			function timeToMinutes(timeStr) {
-				// 格式: "2026-04-24 09:30" 或 "09:30"
-				const timePart = timeStr.includes(' ') ? timeStr.split(' ')[1] : timeStr;
-				const [hour, minute] = timePart.split(':').map(Number);
-				const totalMins = hour * 60 + minute;
-
-				// 09:30 = 0, 11:30 = 120, 13:00 = 120, 15:00 = 240
-				if (totalMins <= 11 * 60 + 30) {
-					// 上午: 09:30 - 11:30
-					return Math.max(0, totalMins - (9 * 60 + 30));
-				} else {
-					// 下午: 13:00 - 15:00
-					return Math.min(totalMinutes, morningEnd + (totalMins - 13 * 60));
-				}
-			}
-
-			// 将交易分钟数转换为X坐标
-			function minutesToX(minutes) {
-				return padding.left + (minutes / totalMinutes) * chartWidth;
-			}
-
-			// 计算价格范围
 			const prices = trends.map(t => t.price);
 			const minPrice = Math.min(...prices, yestclose);
 			const maxPrice = Math.max(...prices, yestclose);
@@ -417,10 +443,10 @@ export class StockWebView {
 			ctx.lineWidth = 1.5;
 			ctx.beginPath();
 
-			const lastX = minutesToX(timeToMinutes(trends[trends.length - 1].time));
+			const lastX = minutesToX(timeToOffset(category, trends[trends.length - 1].time));
 
 			trends.forEach((trend, index) => {
-				const minutes = timeToMinutes(trend.time);
+				const minutes = timeToOffset(category, trend.time);
 				const x = minutesToX(minutes);
 				const y = padding.top + ((actualMax - trend.price) / actualRange) * chartHeight;
 
@@ -448,17 +474,21 @@ export class StockWebView {
 			ctx.fillStyle = gradient;
 			ctx.fill();
 
-			// 时间标签 - 固定显示关键时间点
+			// 时间标签 - 按市场交易时段动态生成
 			ctx.fillStyle = textColor;
 			ctx.font = '9px sans-serif';
 			ctx.textAlign = 'center';
 
-			const timeLabels = ['09:30', '11:30', '13:00', '15:00'];
-			const timeMinutes = [0, 120, 120, 240];
-
-			timeLabels.forEach((label, i) => {
-				const x = minutesToX(timeMinutes[i]);
-				ctx.fillText(label, x, height - 3);
+			let accOffset = 0;
+			axisCfg.sessions.forEach((session, i) => {
+				const [s, e] = session;
+				const startX = minutesToX(accOffset);
+				const endX = minutesToX(accOffset + (e - s));
+				ctx.fillText(fmtTime(s), startX, height - 3);
+				if (i === axisCfg.sessions.length - 1) {
+					ctx.fillText(fmtTime(e), endX, height - 3);
+				}
+				accOffset += e - s;
 			});
 		}
 

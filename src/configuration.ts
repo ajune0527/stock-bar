@@ -26,6 +26,18 @@ export default class Configuration {
 		return typeof updateInterval === 'number' ? updateInterval : 10000;
 	}
 
+	static getAxDataWebSocketUrl(): string {
+		const url = Configuration.stockBarConfig().get('axDataWebSocketUrl');
+		return typeof url === 'string' && url.trim()
+			? url.trim()
+			: 'ws://127.0.0.1:8666/v1/stream/stock_quote_refresh_tdx';
+	}
+
+	static getAxDataToken(): string {
+		const token = Configuration.stockBarConfig().get('axDataToken');
+		return typeof token === 'string' ? token.trim() : '';
+	}
+
 	static getRiseColor() {
 		return Configuration.stockBarConfig().get('riseColor');
 	}

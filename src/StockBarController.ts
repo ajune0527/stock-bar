@@ -1,12 +1,22 @@
 import * as vscode from 'vscode';
+import {
+	AxDataQuoteProvider,
+	fetchAxDataStockNames,
+	selectEastMoneyFallbackStocks,
+	toAxDataInstrument,
+} from './axdata_quote_provider';
 import Configuration from './configuration';
 import { eastMoneyProvider, StockSearchResult } from './eastmoney_provider';
 import logger from './logger';
+import { getMarketName, isAnyTrading, MarketCategory, TabId } from './market';
 import { render, stopAllRender, initRenderCommands } from './render';
 import Stock from './stock';
 import { QuickPickView } from './view/quickpick_view';
+import { StockTrendViewProvider } from './view/stockTrendView';
 import { StockTreeDataProvider } from './view/stockTree';
 import { StockWebView } from './view/webview';
+
+const ACTIVE_TAB_STATE_KEY = 'stockBar.activeTab';
 
 export default class StockBarController {
 	private timer: ReturnType<typeof setInterval> | null = null;
@@ -14,12 +24,20 @@ export default class StockBarController {
 	private quickPickView: QuickPickView;
 	private treeDataProvider: StockTreeDataProvider;
 	private webView: StockWebView;
+	private readonly trendView: StockTrendViewProvider;
+	private context: vscode.ExtensionContext | null = null;
+	private activeTab: TabId = 'all';
+	private readonly axDataQuoteProvider: AxDataQuoteProvider;
+	private feedGeneration = 0;
 
 	constructor() {
 		this.stocks = this.loadChoiceStocks();
+		this.axDataQuoteProvider = new AxDataQuoteProvider();
 		this.quickPickView = new QuickPickView();
 		this.treeDataProvider = new StockTreeDataProvider();
+		this.treeDataProvider.setOnReorder(() => this.restart());
 		this.webView = new StockWebView();
+		this.trendView = new StockTrendViewProvider();
 		this.quickPickView.onRefresh(() => this.restart());
 		this.webView.onRefresh(() => this.restart());
 	}
@@ -30,69 +48,182 @@ export default class StockBarController {
 		});
 	}
 
-	private isTradingTime(): boolean {
-		const now = new Date();
-		// 使用上海时区获取时间
-		const shanghaiTime = new Intl.DateTimeFormat('zh-CN', {
-			timeZone: 'Asia/Shanghai',
-			hour: 'numeric',
-			minute: 'numeric',
-			weekday: 'short',
-			hour12: false,
-		}).formatToParts(now);
-
-		const parts = Object.fromEntries(shanghaiTime.map(p => [p.type, p.value]));
-		const day = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'].indexOf(parts.weekday);
-		// 周末不交易
-		if (day === 0 || day === 6) {
+	private isTradingTime(stocks: readonly Stock[] = this.stocks): boolean {
+		if (stocks.length === 0) {
 			return false;
 		}
-
-		const hour = parseInt(parts.hour, 10);
-		const minute = parseInt(parts.minute, 10);
-		const time = hour * 60 + minute;
-
-		// 上午 9:30 - 11:30
-		const morningStart = 9 * 60 + 30;
-		const morningEnd = 11 * 60 + 30;
-		// 下午 13:00 - 15:00
-		const afternoonStart = 13 * 60;
-		const afternoonEnd = 15 * 60;
-
-		return (time >= morningStart && time <= morningEnd) ||
-			   (time >= afternoonStart && time <= afternoonEnd);
+		// 持仓中任一市场（A股/港股/美股）处于交易时间即刷新
+		const categories = new Set<MarketCategory>();
+		for (const stock of stocks) {
+			categories.add(stock.getCategory());
+		}
+		if (isAnyTrading(categories)) {
+			return true;
+		}
+		logger.debug('非交易时间，跳过数据请求');
+		return false;
 	}
 
-	private async ticker(): Promise<void> {
+	private async ticker(generation = this.feedGeneration): Promise<void> {
+		if (generation !== this.feedGeneration) {
+			return;
+		}
+		const fallbackStocks = selectEastMoneyFallbackStocks(
+			this.stocks,
+			this.axDataQuoteProvider.isConnected(),
+			this.axDataQuoteProvider.coveredCodes(),
+		);
+		if (fallbackStocks.length === 0) {
+			return;
+		}
 		// 非交易时间不请求新数据
-		if (!this.isTradingTime()) {
+		if (!this.isTradingTime(fallbackStocks)) {
 			logger.debug('非交易时间，跳过数据请求');
 			return;
 		}
 
+		await this.fetchEastMoneyQuotes(fallbackStocks, generation);
+	}
+
+	private async fetchEastMoneyQuotes(
+		stocks: readonly Stock[],
+		generation: number,
+	): Promise<void> {
 		try {
 			logger.debug('call fetchData');
-			const secids = this.stocks.map((s) => s.getSecid());
+			const secids = stocks.map((s) => s.getSecid());
 			const stockData = await eastMoneyProvider.fetch(secids);
+			if (generation !== this.feedGeneration) {
+				return;
+			}
 
 			stockData.forEach((data) => {
-				const stock = this.stocks.find(
+				const stock = stocks.find(
 					(s) => s.code.toLowerCase() === data.code?.toLowerCase(),
 				);
 				if (stock && data) {
-					stock.update(data as Stock);
+					const axDataOwnsQuote =
+						toAxDataInstrument(stock) !== null &&
+						this.axDataQuoteProvider.isConnected() &&
+						this.axDataQuoteProvider
+							.coveredCodes()
+							.has(stock.code.toLowerCase());
+					stock.update(
+						axDataOwnsQuote ? { name: data.name } : (data as Partial<Stock>),
+					);
 				}
 			});
 
-			logger.debug('render');
-			render(this.stocks);
-
-			this.quickPickView.updateStocks(this.stocks);
-			this.treeDataProvider.updateStocks(this.stocks);
-			this.webView.updateStocks(this.stocks);
+			this.applyRender();
 		} catch (error) {
 			logger.error('%O', error);
 		}
+	}
+
+	private startAxData(generation: number): void {
+		const instruments = this.stocks
+			.map((stock) => toAxDataInstrument(stock))
+			.filter((instrument): instrument is string => instrument !== null);
+		if (instruments.length === 0) {
+			return;
+		}
+
+		this.axDataQuoteProvider.start({
+			url: Configuration.getAxDataWebSocketUrl(),
+			token: Configuration.getAxDataToken(),
+			instruments,
+			intervalMs: Configuration.getUpdateInterval(),
+			onQuotes: (updates) => {
+				if (generation !== this.feedGeneration) {
+					return;
+				}
+				for (const update of updates) {
+					const stock = this.stocks.find(
+						(item) =>
+							toAxDataInstrument(item) !== null &&
+							item.code.toLowerCase() === update.code?.toLowerCase(),
+					);
+					if (stock) {
+						stock.update(update);
+					}
+				}
+				this.applyRender();
+			},
+			onStateChange: (connected) => {
+				if (generation !== this.feedGeneration) {
+					return;
+				}
+				logger.debug(connected ? 'AxData 行情已连接' : 'AxData 行情已断开');
+				if (!connected) {
+					void this.ticker(generation);
+				}
+			},
+			onError: (error) => {
+				if (generation === this.feedGeneration) {
+					logger.error('AxData 行情错误: %s', error.message);
+				}
+			},
+		});
+	}
+
+	private async loadAxDataStockNames(generation: number): Promise<void> {
+		const instruments = this.stocks
+			.map((stock) => toAxDataInstrument(stock))
+			.filter((instrument): instrument is string => instrument !== null);
+		try {
+			const names = await fetchAxDataStockNames(
+				Configuration.getAxDataWebSocketUrl(),
+				Configuration.getAxDataToken(),
+				instruments,
+			);
+			if (generation !== this.feedGeneration) {
+				return;
+			}
+			for (const update of names) {
+				const stock = this.stocks.find(
+					(item) => toAxDataInstrument(item) === update.instrumentId,
+				);
+				stock?.update({ name: update.name });
+			}
+			this.applyRender();
+		} catch (error) {
+			logger.error('AxData 股票名称加载失败: %O', error);
+		}
+	}
+
+	/**
+	 * 过滤当前 Tab 下的股票
+	 */
+	private getFilteredStocks(): Stock[] {
+		if (this.activeTab === 'all') {
+			return this.stocks;
+		}
+		return this.stocks.filter((s) => s.getCategory() === this.activeTab);
+	}
+
+	/**
+	 * 用当前已拉取的数据渲染所有视图（按当前 Tab 过滤）
+	 */
+	private applyRender(): void {
+		const filtered = this.getFilteredStocks();
+		logger.debug('render');
+		render(filtered);
+		this.quickPickView.updateStocks(filtered);
+		this.treeDataProvider.updateStocks(filtered, this.activeTab);
+		this.webView.updateStocks(filtered);
+		this.trendView.syncStocks(this.stocks);
+	}
+
+	/**
+	 * 切换分类 Tab
+	 */
+	public switchTab(tab: TabId): void {
+		if (this.activeTab === tab) {
+			return;
+		}
+		this.activeTab = tab;
+		this.context?.globalState.update(ACTIVE_TAB_STATE_KEY, tab);
+		this.applyRender();
 	}
 
 	public openStockList(): void {
@@ -144,12 +275,12 @@ export default class StockBarController {
 		const market = result.market;
 
 		const currentStocks = Configuration.getStocks() || [];
-		const exists = currentStocks.some(
-			(item) => item.code === code,
-		);
+		const exists = currentStocks.some((item) => item.code === code);
 
 		if (exists) {
-			vscode.window.showInformationMessage('股票 ' + result.name + ' (' + code + ') 已存在！');
+			vscode.window.showInformationMessage(
+				'股票 ' + result.name + ' (' + code + ') 已存在！',
+			);
 			return;
 		}
 
@@ -161,47 +292,82 @@ export default class StockBarController {
 			vscode.ConfigurationTarget.Global,
 		);
 
-		vscode.window.showInformationMessage('已添加：' + result.name + ' (' + code + ')');
+		vscode.window.showInformationMessage(
+			'已添加：' + result.name + ' (' + code + ')',
+		);
 		this.restart();
 	}
 
 	private getMarketName(market: string): string {
-		const marketMap: Record<string, string> = {
-			'1': '沪市A股',
-			'0': '深市A股',
-		};
-		return marketMap[market] || market;
+		return getMarketName(market);
 	}
 
 	public restart(): void {
 		const interval = Configuration.getUpdateInterval();
+		this.feedGeneration += 1;
+		const generation = this.feedGeneration;
 		if (this.timer) clearInterval(this.timer);
+		this.axDataQuoteProvider.stop();
 		this.stocks = this.loadChoiceStocks();
-		this.timer = setInterval(() => this.ticker(), interval);
-		this.ticker();
+		this.applyRender();
+		this.startAxData(generation);
+		void this.loadAxDataStockNames(generation);
+		void this.fetchEastMoneyQuotes(this.stocks, generation);
+		this.timer = setInterval(() => void this.ticker(generation), interval);
 	}
 
 	public stop(): void {
+		this.feedGeneration += 1;
 		if (this.timer) clearInterval(this.timer);
 		this.timer = null;
+		this.axDataQuoteProvider.stop();
 		stopAllRender();
 	}
 
 	public registerCommands(context: vscode.ExtensionContext): void {
+		this.context = context;
+		this.activeTab =
+			context.globalState.get<TabId>(ACTIVE_TAB_STATE_KEY) ?? 'all';
+
 		const treeView = vscode.window.createTreeView('stockBarList', {
 			treeDataProvider: this.treeDataProvider,
 			showCollapseAll: false,
+			dragAndDropController: this.treeDataProvider,
+		});
+		const trendViewRegistration = vscode.window.registerWebviewViewProvider(
+			'stockBarTrend',
+			this.trendView,
+			{
+				webviewOptions: {
+					retainContextWhenHidden: true,
+				},
+			},
+		);
+		const treeSelection = treeView.onDidChangeSelection((event) => {
+			const node = event.selection[0];
+			if (node?.nodeType === 'stock' && node.stock) {
+				this.trendView.showStock(node.stock);
+			}
 		});
 
 		initRenderCommands(context);
 
 		context.subscriptions.push(
 			treeView,
+			trendViewRegistration,
+			treeSelection,
 			vscode.commands.registerCommand('stockbar.start', () => this.restart()),
 			vscode.commands.registerCommand('stockbar.stop', () => this.stop()),
 			vscode.commands.registerCommand('stockbar.add', () => this.openSearch()),
-			vscode.commands.registerCommand('stockbar.list', () => this.openStockList()),
-			vscode.commands.registerCommand('stockbar.webview', () => this.webView.show()),
+			vscode.commands.registerCommand('stockbar.list', () =>
+				this.openStockList(),
+			),
+			vscode.commands.registerCommand('stockbar.webview', () =>
+				this.webView.show(),
+			),
+			vscode.commands.registerCommand('stockbar.switchTab', (tab: TabId) =>
+				this.switchTab(tab),
+			),
 			vscode.commands.registerCommand('stockbar.refresh', () => {
 				this.restart();
 				vscode.window.showInformationMessage('数据已刷新');
@@ -232,11 +398,14 @@ export default class StockBarController {
 					this.moveStock(node.stock, 'top');
 				}
 			}),
-			vscode.commands.registerCommand('stockbar.treeItem.moveBottom', (node) => {
-				if (node?.stock) {
-					this.moveStock(node.stock, 'bottom');
-				}
-			}),
+			vscode.commands.registerCommand(
+				'stockbar.treeItem.moveBottom',
+				(node) => {
+					if (node?.stock) {
+						this.moveStock(node.stock, 'bottom');
+					}
+				},
+			),
 			vscode.workspace.onDidChangeConfiguration(() => {
 				if (this.timer) this.restart();
 			}),
@@ -255,9 +424,7 @@ export default class StockBarController {
 		if (confirm !== '确定') return;
 
 		const currentStocks = Configuration.getStocks() || [];
-		const newStocks = currentStocks.filter(
-			(item) => item.code !== stock.code,
-		);
+		const newStocks = currentStocks.filter((item) => item.code !== stock.code);
 
 		await Configuration.stockBarConfig().update(
 			'stocks',
@@ -265,13 +432,20 @@ export default class StockBarController {
 			vscode.ConfigurationTarget.Global,
 		);
 
-		vscode.window.showInformationMessage('已删除：' + (stock.name || stock.code));
+		vscode.window.showInformationMessage(
+			'已删除：' + (stock.name || stock.code),
+		);
 		this.restart();
 	}
 
-	private async moveStock(stock: Stock, direction: 'up' | 'down' | 'top' | 'bottom'): Promise<void> {
+	private async moveStock(
+		stock: Stock,
+		direction: 'up' | 'down' | 'top' | 'bottom',
+	): Promise<void> {
 		const currentStocks = Configuration.getStocks() || [];
-		const currentIndex = currentStocks.findIndex(item => item.code === stock.code);
+		const currentIndex = currentStocks.findIndex(
+			(item) => item.code === stock.code,
+		);
 
 		if (currentIndex === -1) return;
 
